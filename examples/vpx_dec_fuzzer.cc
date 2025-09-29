@@ -86,7 +86,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   if (size <= IVF_FILE_HDR_SZ) {
     return 0;
   }
-  nalloc_init(NULL);
+  nalloc_init(nullptr);
 
   vpx_codec_ctx_t codec;
   // Set thread count in the range [1, 64].
@@ -95,7 +95,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   if (vpx_codec_dec_init(&codec, VPXD_INTERFACE(DECODER), &cfg, 0)) {
     return 0;
   }
+    long deadline = 0;
+    if ((data[IVF_FILE_HDR_SZ] & 0x40) != 0) {
+        if (vpx_codec_dec_init(&codec, VPXD_INTERFACE(DECODER), NULL, VPX_CODEC_USE_POSTPROC)) {
+            return 0;
+        }
+        // Decode the frame with 15ms deadline
+        deadline = 15000;
+    }
+
   nalloc_start(data, size);
+
+  FILE *devnull = fopen("/dev/null", "wb")
 
   if (threads > 1) {
     const int enable = (data[IVF_FILE_HDR_SZ] & 0xa0) != 0;
@@ -107,6 +118,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   data += IVF_FILE_HDR_SZ;
   size -= IVF_FILE_HDR_SZ;
 
+    int frame_cnt = 0;
   while (size > IVF_FRAME_HDR_SZ) {
     size_t frame_size = mem_get_le32(data);
     size -= IVF_FRAME_HDR_SZ;
@@ -119,15 +131,45 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                                                      data, size, &stream_info);
     static_cast<void>(err);
 
-    err = vpx_codec_decode(&codec, data, frame_size, nullptr, 0);
+    ++frame_cnt;
+      if (deadline > 0) {
+          if (frame_cnt % 16 == 4) {
+              vp8_postproc_cfg_t pp = { 0, 0, 0 };
+              if (vpx_codec_control(&codec, VP8_SET_POSTPROC, &pp))
+                  goto out;
+          } else if (frame_cnt % 16 == 12) {
+              vp8_postproc_cfg_t pp = { VP8_DEBLOCK | VP8_DEMACROBLOCK | VP8_MFQE, 4,
+                  0 };
+              if (vpx_codec_control(&codec, VP8_SET_POSTPROC, &pp))
+                  goto out;
+          }
+      }
+
+    err = vpx_codec_decode(&codec, data, frame_size, nullptr, deadline);
     static_cast<void>(err);
     vpx_codec_iter_t iter = nullptr;
     vpx_image_t *img = nullptr;
     while ((img = vpx_codec_get_frame(&codec, &iter)) != nullptr) {
+        int csum = 0;
+        for (plane = 0; plane < 3; ++plane) {
+          const unsigned char *buf = img->planes[plane];
+          const int stride = img->stride[plane];
+          const int w = plane ? (img->d_w + 1) >> 1 : img->d_w;
+          const int h = plane ? (img->d_h + 1) >> 1 : img->d_h;
+
+          for (y = 0; y < h; ++y) {
+            csum += buf[0];
+            csum += buf[w];
+            buf += stride;
+          }
+        }
+        fprintf(devnull, "csum %d\n", csum);
+        vpx_img_write(img, devnull);
     }
     data += frame_size;
     size -= frame_size;
   }
+out:
   vpx_codec_destroy(&codec);
   nalloc_end();
   return 0;
