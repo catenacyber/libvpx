@@ -92,21 +92,20 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   // Set thread count in the range [1, 64].
   const unsigned int threads = (data[IVF_FILE_HDR_SZ] & 0x3f) + 1;
   vpx_codec_dec_cfg_t cfg = { threads, 0, 0 };
-  if (vpx_codec_dec_init(&codec, VPXD_INTERFACE(DECODER), &cfg, 0)) {
-    return 0;
-  }
     long deadline = 0;
+    vpx_codec_flags_t flags = 0;
     if ((data[IVF_FILE_HDR_SZ] & 0x40) != 0) {
-        if (vpx_codec_dec_init(&codec, VPXD_INTERFACE(DECODER), NULL, VPX_CODEC_USE_POSTPROC)) {
-            return 0;
-        }
+        flags = VPX_CODEC_USE_POSTPROC;
         // Decode the frame with 15ms deadline
         deadline = 15000;
     }
+  if (vpx_codec_dec_init(&codec, VPXD_INTERFACE(DECODER), &cfg, flags)) {
+    return 0;
+  }
 
   nalloc_start(data, size);
 
-  FILE *devnull = fopen("/dev/null", "wb")
+  FILE *devnull = fopen("/dev/null", "wb");
 
   if (threads > 1) {
     const int enable = (data[IVF_FILE_HDR_SZ] & 0xa0) != 0;
@@ -151,6 +150,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     vpx_image_t *img = nullptr;
     while ((img = vpx_codec_get_frame(&codec, &iter)) != nullptr) {
         int csum = 0;
+        int plane, y;
         for (plane = 0; plane < 3; ++plane) {
           const unsigned char *buf = img->planes[plane];
           const int stride = img->stride[plane];
@@ -164,12 +164,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
           }
         }
         fprintf(devnull, "csum %d\n", csum);
-        vpx_img_write(img, devnull);
     }
     data += frame_size;
     size -= frame_size;
   }
 out:
+  fclose(devnull);
   vpx_codec_destroy(&codec);
   nalloc_end();
   return 0;
