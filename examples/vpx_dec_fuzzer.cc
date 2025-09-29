@@ -103,9 +103,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     return 0;
   }
 
-  nalloc_start(data, size);
-
   FILE *devnull = fopen("/dev/null", "wb");
+  nalloc_start(data, size);
 
   if (threads > 1) {
     const int enable = (data[IVF_FILE_HDR_SZ] & 0xa0) != 0;
@@ -169,8 +168,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     size -= frame_size;
   }
 out:
-  fclose(devnull);
   vpx_codec_destroy(&codec);
   nalloc_end();
+  fclose(devnull);
   return 0;
 }
