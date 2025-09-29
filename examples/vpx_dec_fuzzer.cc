@@ -92,13 +92,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   // Set thread count in the range [1, 64].
   const unsigned int threads = (data[IVF_FILE_HDR_SZ] & 0x3f) + 1;
   vpx_codec_dec_cfg_t cfg = { threads, 0, 0 };
-    long deadline = 0;
-    vpx_codec_flags_t flags = 0;
-    if ((data[IVF_FILE_HDR_SZ] & 0x40) != 0) {
-        flags = VPX_CODEC_USE_POSTPROC;
-        // Decode the frame with 15ms deadline
-        deadline = 15000;
-    }
+  vpx_codec_flags_t flags = 0;
+  if ((data[IVF_FILE_HDR_SZ] & 0x40) != 0) {
+    flags |= VPX_CODEC_USE_POSTPROC;
+  }
   if (vpx_codec_dec_init(&codec, VPXD_INTERFACE(DECODER), &cfg, flags)) {
     return 0;
   }
@@ -116,7 +113,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   data += IVF_FILE_HDR_SZ;
   size -= IVF_FILE_HDR_SZ;
 
-    int frame_cnt = 0;
+  int frame_cnt = 0;
   while (size > IVF_FRAME_HDR_SZ) {
     size_t frame_size = mem_get_le32(data);
     size -= IVF_FRAME_HDR_SZ;
@@ -130,7 +127,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     static_cast<void>(err);
 
     ++frame_cnt;
-      if (deadline > 0) {
+      if (flags & VPX_CODEC_USE_POSTPROC) {
           if (frame_cnt % 16 == 4) {
               vp8_postproc_cfg_t pp = { 0, 0, 0 };
               if (vpx_codec_control(&codec, VP8_SET_POSTPROC, &pp))
@@ -143,26 +140,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
           }
       }
 
-    err = vpx_codec_decode(&codec, data, frame_size, nullptr, deadline);
+    err = vpx_codec_decode(&codec, data, frame_size, nullptr, 0);
     static_cast<void>(err);
     vpx_codec_iter_t iter = nullptr;
     vpx_image_t *img = nullptr;
     while ((img = vpx_codec_get_frame(&codec, &iter)) != nullptr) {
-        int csum = 0;
-        int plane, y;
-        for (plane = 0; plane < 3; ++plane) {
-          const unsigned char *buf = img->planes[plane];
-          const int stride = img->stride[plane];
-          const int w = plane ? (img->d_w + 1) >> 1 : img->d_w;
-          const int h = plane ? (img->d_h + 1) >> 1 : img->d_h;
-
-          for (y = 0; y < h; ++y) {
-            csum += buf[0];
-            csum += buf[w];
-            buf += stride;
-          }
-        }
-        fprintf(devnull, "csum %d\n", csum);
     }
     data += frame_size;
     size -= frame_size;
