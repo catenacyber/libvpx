@@ -67,6 +67,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "vpx/vp8cx.h"
 #include "vpx/vpx_encoder.h"
@@ -75,6 +76,7 @@
 
 // fuzz header to have config options, before raw image data
 #define FUZZ_HDR_SZ 32
+#define MAX_FUZZ_FRAMES 64
 
 #define VPXC_INTERFACE(name) VPXC_INTERFACE_(name)
 #define VPXC_INTERFACE_(name) vpx_codec_##name##_cx()
@@ -156,18 +158,96 @@ static int encode_frame(vpx_codec_ctx_t *codec, vpx_image_t *img,
   return got_pkts;
 }
 
+static void apply_control_op(vpx_codec_ctx_t *codec, uint8_t op, uint8_t arg,
+                             int is_vp9) {
+  switch (op % 15) {
+    case 0: {
+      const int cpu_used = is_vp9 ? (int)(arg % 10) : -((int)(arg % 16));
+      vpx_codec_control(codec, VP8E_SET_CPUUSED, cpu_used);
+      break;
+    }
+    case 1:
+      vpx_codec_control(codec, VP8E_SET_STATIC_THRESHOLD, (unsigned int)arg);
+      break;
+    case 2:
+      vpx_codec_control(codec, VP8E_SET_MAX_INTRA_BITRATE_PCT,
+                        (unsigned int)((arg + 1) * 8));
+      break;
+    case 3:
+      if (is_vp9) vpx_codec_control(codec, VP9E_SET_TILE_COLUMNS, (int)(arg % 7));
+      break;
+    case 4:
+      if (is_vp9) vpx_codec_control(codec, VP9E_SET_ROW_MT, (unsigned int)(arg & 1));
+      break;
+    case 5:
+      if (is_vp9) vpx_codec_control(codec, VP9E_SET_AQ_MODE, (unsigned int)(arg % 4));
+      break;
+    case 6:
+      if (is_vp9)
+        vpx_codec_control(codec, VP9E_SET_TUNE_CONTENT,
+                          (int)(arg % VP9E_CONTENT_INVALID));
+      break;
+    case 7:
+      if (is_vp9) vpx_codec_control(codec, VP9E_SET_SVC, (int)(arg & 1));
+      break;
+    case 8:
+      if (is_vp9)
+        vpx_codec_control(codec, VP9E_SET_QUANTIZER_ONE_PASS, (int)(arg % 64));
+      break;
+    case 9:
+      vpx_codec_control(codec, VP8E_SET_TOKEN_PARTITIONS,
+                        (int)(arg % (VP8_EIGHT_TOKENPARTITION + 1)));
+      break;
+    case 10:
+      if (is_vp9)
+        vpx_codec_control(codec, VP9E_SET_DISABLE_OVERSHOOT_MAXQ_CBR,
+                          (int)(arg & 1));
+      break;
+    case 11:
+      if (is_vp9)
+        vpx_codec_control(codec, VP9E_SET_DISABLE_LOOPFILTER,
+                          (int)(arg % 3));
+      break;
+    case 12:
+      if (!is_vp9)
+        vpx_codec_control(codec, VP8E_SET_SCREEN_CONTENT_MODE,
+                          (unsigned int)(arg % 3));
+      break;
+    case 13: {
+      int frame_flags = 0;
+      if (arg & 1) frame_flags |= VP8_EFLAG_NO_REF_LAST;
+      if (arg & 2) frame_flags |= VP8_EFLAG_NO_REF_GF;
+      if (arg & 4) frame_flags |= VP8_EFLAG_NO_UPD_LAST;
+      if (arg & 8) frame_flags |= VP8_EFLAG_NO_UPD_GF;
+      vpx_codec_control(codec, VP8E_SET_FRAME_FLAGS, frame_flags);
+      break;
+    }
+    case 14:
+      // do nothing
+      break;
+  }
+}
+
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   if (size <= FUZZ_HDR_SZ) {
     return 0;
   }
   nalloc_init(nullptr);
 
+  const int is_vp9 = VPXC_INTERFACE(ENCODER) == vpx_codec_vp9_cx();
   int keyframe_interval = 0;
   int frame_count = 0;
   vpx_codec_ctx_t codec;
+  memset(&codec, 0, sizeof(codec));
   vpx_image_t raw;
+  memset(&raw, 0, sizeof(raw));
   vpx_codec_enc_cfg_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
   vpx_enc_deadline_t quality = VPX_DL_GOOD_QUALITY;
+  const uint8_t *control_data = nullptr;
+  size_t control_size = 0;
+  int reconfig_at;
+  int reconfigured = 0;
 
   if ((data[0] & 0x80) != 0) {
     keyframe_interval = 8;
@@ -191,12 +271,31 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   }
   cfg.g_timebase.num = 1;
   cfg.g_timebase.den = 30;  // fps
-  cfg.rc_target_bitrate = 200;
+  cfg.rc_target_bitrate = 200 + (unsigned int)(data[1]);
+  cfg.g_threads = 1 + (unsigned int)(data[2] & 7);
+  cfg.g_lag_in_frames = (unsigned int)(data[3] % 3);
+  cfg.kf_mode = (data[3] & 1) ? VPX_KF_AUTO : VPX_KF_DISABLED;
+  cfg.kf_min_dist = 0;
+  cfg.kf_max_dist = cfg.kf_min_dist + 6 + (unsigned int)(data[4] % 32);
+  cfg.rc_end_usage = (data[5] & 1) ? VPX_CBR : VPX_VBR;
+  cfg.rc_dropframe_thresh = (unsigned int)(data[6] % 50);
+  cfg.rc_overshoot_pct = 15 + (unsigned int)(data[7] % 85);
+  cfg.rc_undershoot_pct = 15 + (unsigned int)(data[8] % 85);
   cfg.g_error_resilient = 1;
+
+  const size_t control_stream_len = (size_t)((unsigned int)data[9] << 1);
+  const size_t bounded_control_len =
+      (control_stream_len < (size - FUZZ_HDR_SZ) / 2)
+          ? control_stream_len
+          : (size - FUZZ_HDR_SZ) / 2;
+  reconfig_at = 1 + (data[10] % 12);
 
   if (vpx_codec_enc_init(&codec, VPXC_INTERFACE(ENCODER), &cfg, 0)) {
     return 0;
   }
+
+  apply_control_op(&codec, data[11], data[12], is_vp9);
+  apply_control_op(&codec, data[13], data[14], is_vp9);
 
   if (!vpx_img_alloc(&raw, VPX_IMG_FMT_I420, cfg.g_w, cfg.g_h, 1)) {
     goto fail;
@@ -210,15 +309,45 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   data += FUZZ_HDR_SZ;
   size -= FUZZ_HDR_SZ;
 
+  control_data = data;
+  control_size = bounded_control_len;
+  data += control_size;
+  size -= control_size;
+
   // Encode frames.
-  while (1) {
+  while (frame_count < MAX_FUZZ_FRAMES) {
     int flags = 0;
+    if (control_size >= 2) {
+      apply_control_op(&codec, control_data[0], control_data[1], is_vp9);
+      control_data += 2;
+      control_size -= 2;
+    }
+
     size_t size_read = fuzz_vpx_img_read(&raw, data, size);
     if (size_read == 0) break;
     data += size_read;
     size -= size_read;
     if (keyframe_interval > 0 && frame_count % keyframe_interval == 0)
       flags |= VPX_EFLAG_FORCE_KF;
+
+    if (!reconfigured && frame_count == reconfig_at && size >= 2) {
+      vpx_codec_enc_cfg_t new_cfg = cfg;
+      if (data[0] & 0x80 && cfg.rc_target_bitrate > 1 + (unsigned int)(data[0] & 0x7F)) {
+        new_cfg.rc_target_bitrate =
+            cfg.rc_target_bitrate - 1 - (unsigned int)(data[0] & 0x7F);
+      } else {
+        new_cfg.rc_target_bitrate =
+            cfg.rc_target_bitrate + 1 + (unsigned int)(data[0]);
+      }
+      new_cfg.rc_dropframe_thresh =
+          (unsigned int)((cfg.rc_dropframe_thresh + data[1]) % 100);
+      (void)vpx_codec_enc_config_set(&codec, &new_cfg);
+      cfg = new_cfg;
+      reconfigured = 1;
+      data += 2;
+      size -= 2;
+    }
+
     encode_frame(&codec, &raw, frame_count++, flags, out, quality);
   }
 
